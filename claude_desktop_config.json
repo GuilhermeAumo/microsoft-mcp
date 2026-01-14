@@ -1,0 +1,18 @@
+{
+    "mcpServers": {
+        "microsoft": {
+            "command": "docker",
+            "args": [
+                "run",
+                "-i",
+                "--rm",
+                "-v",
+                "name_of_the_volume:/root/.microsoft_mcp_token_cache.json",
+                "-e",
+                "MICROSOFT_MCP_CLIENT_ID=",
+                "aumoai/microsoft-mcp:latest"
+            ]
+        }
+    }
+}
+  

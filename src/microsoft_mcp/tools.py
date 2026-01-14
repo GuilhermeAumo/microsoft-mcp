@@ -1,7 +1,9 @@
 import base64
 import datetime as dt
+import io
 import pathlib as pl
 from typing import Any
+from docx import Document
 from fastmcp import FastMCP
 from . import graph, auth
 
@@ -746,58 +748,211 @@ def list_files(
 
 
 @mcp.tool
-def get_file(file_id: str, account_id: str, download_path: str) -> dict[str, Any]:
-    """Download a file from OneDrive to local path"""
-    import subprocess
-
+def get_file(file_id: str, account_id: str) -> dict[str, Any]:
+    """Get file content from OneDrive and return it in the result
+    
+    Args:
+        file_id: The OneDrive file ID
+        account_id: The account ID to use
+    
+    Returns:
+        Dictionary with file metadata and content:
+        - For text files: content is returned as a string
+        - For binary files: content is returned as base64-encoded string
+    """
     metadata = graph.request("GET", f"/me/drive/items/{file_id}", account_id)
     if not metadata:
         raise ValueError(f"File with ID {file_id} not found")
 
-    download_url = metadata.get("@microsoft.graph.downloadUrl")
-    if not download_url:
-        raise ValueError("No download URL available for this file")
-
+    # Get file content using the /content endpoint
     try:
-        subprocess.run(
-            ["curl", "-L", "-o", download_path, download_url],
-            check=True,
-            capture_output=True,
+        content_bytes = graph.download_raw(
+            f"/me/drive/items/{file_id}/content",
+            account_id
         )
+    except Exception as e:
+        raise ValueError(f"Failed to download file content: {e}")
 
-        return {
-            "path": download_path,
-            "name": metadata.get("name", "unknown"),
-            "size_mb": round(metadata.get("size", 0) / (1024 * 1024), 2),
-            "mime_type": metadata.get("file", {}).get("mimeType") if metadata else None,
-        }
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"Failed to download file: {e.stderr.decode()}")
+    # Get mime type and file name to determine how to process
+    mime_type = metadata.get("file", {}).get("mimeType", "application/octet-stream")
+    file_name = metadata.get("name", "").lower()
+    
+    # Check if it's a Word document (.docx)
+    is_word_doc = (
+        mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        or file_name.endswith(".docx")
+    )
+    
+    # Extract text from Word documents
+    if is_word_doc:
+        try:
+            # Load Word document from bytes
+            doc = Document(io.BytesIO(content_bytes))
+            # Extract all text from paragraphs
+            paragraphs = [para.text for para in doc.paragraphs]
+            content = "\n".join(paragraphs)
+            is_text = True
+            encoding = "utf-8"
+        except Exception:
+            # If extraction fails, fall back to base64
+            content = base64.b64encode(content_bytes).decode("utf-8")
+            is_text = False
+            encoding = "base64"
+    else:
+        # Determine if it's a text file based on mime type
+        text_mime_types = [
+            "text/",
+            "application/json",
+            "application/xml",
+            "application/javascript",
+            "application/x-sh",
+            "application/x-python",
+        ]
+        is_text = any(mime_type.startswith(prefix) for prefix in text_mime_types)
+        
+        # Return content as text or base64
+        if is_text:
+            try:
+                # Try to decode as UTF-8
+                content = content_bytes.decode("utf-8")
+                encoding = "utf-8"
+            except UnicodeDecodeError:
+                # If UTF-8 fails, encode as base64
+                content = base64.b64encode(content_bytes).decode("utf-8")
+                is_text = False
+                encoding = "base64"
+        else:
+            # Binary file - encode as base64
+            content = base64.b64encode(content_bytes).decode("utf-8")
+            encoding = "base64"
+
+    return {
+        "id": file_id,
+        "name": metadata.get("name", "unknown"),
+        "size": metadata.get("size", 0),
+        "size_mb": round(metadata.get("size", 0) / (1024 * 1024), 2),
+        "mime_type": mime_type,
+        "content": content,
+        "is_text": is_text,
+        "encoding": encoding,
+    }
 
 
 @mcp.tool
 def create_file(
-    onedrive_path: str, local_file_path: str, account_id: str
+    onedrive_path: str, file_name: str, file_content: str, account_id: str
 ) -> dict[str, Any]:
-    """Upload a local file to OneDrive"""
-    path = pl.Path(local_file_path).expanduser().resolve()
-    data = path.read_bytes()
+    """Create a Word document in OneDrive from text content
+    
+    Args:
+        onedrive_path: The OneDrive folder path (e.g., "/Documents" or "/")
+        file_name: Name of the file (without .docx extension, will be added automatically)
+        file_content: The text content to include in the Word document
+        account_id: The account ID to use
+    """
+    # Ensure file_name has .docx extension
+    if not file_name.endswith('.docx'):
+        file_name = f"{file_name}.docx"
+    
+    # Create Word document in memory
+    doc = Document()
+    # Add content to document (split by newlines to create paragraphs)
+    for line in file_content.split('\n'):
+        doc.add_paragraph(line)
+    
+    # Save document to bytes
+    doc_bytes = io.BytesIO()
+    doc.save(doc_bytes)
+    doc_bytes.seek(0)
+    data = doc_bytes.read()
+    
+    # Construct full path
+    if onedrive_path == "/" or onedrive_path == "":
+        full_path = f"/{file_name}"
+    else:
+        full_path = f"{onedrive_path.rstrip('/')}/{file_name}"
+    
     result = graph.upload_large_file(
-        f"/me/drive/root:/{onedrive_path}:", data, account_id
+        f"/me/drive/root:{full_path}:", data, account_id
     )
     if not result:
-        raise ValueError(f"Failed to create file at path: {onedrive_path}")
+        raise ValueError(f"Failed to create file at path: {full_path}")
     return result
 
 
 @mcp.tool
-def update_file(file_id: str, local_file_path: str, account_id: str) -> dict[str, Any]:
-    """Update OneDrive file content from a local file"""
-    path = pl.Path(local_file_path).expanduser().resolve()
-    data = path.read_bytes()
-    result = graph.upload_large_file(f"/me/drive/items/{file_id}", data, account_id)
+def update_file(
+    file_id: str, file_name: str, file_content: str, account_id: str
+) -> dict[str, Any]:
+    """Update a OneDrive file with new Word document content and optionally rename it
+    
+    Args:
+        file_id: The OneDrive file ID to update
+        file_name (Optional): Name of the file (without .docx extension, will be added automatically)
+        file_content (Optional): The text content to include in the Word document
+        account_id: The account ID to use
+    """
+    # Ensure file_name has .docx extension
+    if not file_name.endswith('.docx'):
+        file_name = f"{file_name}.docx"
+    
+    # Get current file metadata to check if name needs updating
+    current_file = graph.request("GET", f"/me/drive/items/{file_id}", account_id)
+    if not current_file:
+        raise ValueError(f"File with ID {file_id} not found")
+    
+    current_name = current_file.get("name", "")
+    name_changed = current_name != file_name
+    
+    # Create Word document in memory
+    doc = Document()
+    # Add content to document (split by newlines to create paragraphs)
+    for line in file_content.split('\n'):
+        doc.add_paragraph(line)
+    
+    # Save document to bytes
+    doc_bytes = io.BytesIO()
+    doc.save(doc_bytes)
+    doc_bytes.seek(0)
+    data = doc_bytes.read()
+    
+    # Update file content using PUT to /content endpoint
+    # For small files, use direct PUT. For large files, use upload session.
+    # The chunk size is 4.5MB (15 * 320 KiB)
+    file_size = len(data)
+    UPLOAD_CHUNK_SIZE = 15 * 320 * 1024  # 4,915,200 bytes
+    
+    if file_size <= UPLOAD_CHUNK_SIZE:
+        # Direct PUT for small files - this is the most reliable method for updates
+        # Using explicit PUT to /content endpoint ensures the file content is replaced
+        result = graph.request(
+            "PUT",
+            f"/me/drive/items/{file_id}/content",
+            account_id,
+            data=data
+        )
+    else:
+        # For large files, use upload session approach
+        result = graph.upload_large_file(
+            f"/me/drive/items/{file_id}",
+            data,
+            account_id
+        )
+    
     if not result:
         raise ValueError(f"Failed to update file with ID: {file_id}")
+    
+    # Update file name if it changed
+    if name_changed:
+        name_update = graph.request(
+            "PATCH",
+            f"/me/drive/items/{file_id}",
+            account_id,
+            json={"name": file_name}
+        )
+        if name_update:
+            result["name"] = name_update.get("name", file_name)
+    
     return result
 
 
